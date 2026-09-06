@@ -1,344 +1,274 @@
 require('dotenv').config();
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { WebcastPushConnection } = require('tiktok-live-connector');
 
-const PORT = process.env.PORT || 3000;
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',');
+const PORT = process.env.PORT || 8080;
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
 
 // ---------------------------------------------------------------------------
-// STATE
+// Global state
 // ---------------------------------------------------------------------------
 const state = {
   connected: false,
-  connecting: false,
   username: null,
-  roomInfo: null,
-  lastError: null,
-
-  stats: {
-    likes: 0,
-    followers: 0,
-    coins: 0,
-    shares: 0,
-    comments: 0,
-    viewers: 0,
+  stats: { likes: 0, followers: 0, shares: 0, diamonds: 0, viewers: 0 },
+  likeLeaderboard: new Map(), // uniqueId -> { uniqueId, nickname, profilePicture, likes }
+  giftLeaderboard: new Map(), // uniqueId -> { uniqueId, nickname, profilePicture, diamonds }
+  goal: {
+    type: 'likes', // likes | followers | coins | share
+    label: 'Like Goal',
+    target: 1000,
+    current: 0,
   },
-
-  // userId -> { userId, uniqueId, nickname, profilePicture, value }
-  likeLeaderboard: {},
-  giftLeaderboard: {},
-
-  comments: [], // { userId, uniqueId, nickname, profilePicture, comment, ts }
-
-  settings: {
-    likeLeaderboardSize: 5,
-    giftLeaderboardSize: 5,
-  },
-
-  goals: {
-    like:     { enabled: true,  target: 10000, current: 0 },
-    follower: { enabled: true,  target: 100,   current: 0 },
-    coin:     { enabled: true,  target: 5000,  current: 0 },
-    share:    { enabled: false, target: 100,   current: 0 },
-  },
-
   subathon: {
-    running: false,
-    remainingSeconds: 3600,
-    // seconds added per unit of each event type
+    active: false,
+    endsAt: null, // epoch ms
     rules: {
-      like:     0,     // seconds per like
-      follower: 10,    // seconds per new follower
-      coin:     1,     // seconds per coin (gift diamond)
-      share:    30,    // seconds per share
+      secondsPerLike: 0, // e.g. 0.1 = 10 likes -> 1s
+      secondsPerFollow: 10,
+      secondsPerShare: 15,
+      secondsPerDiamond: 1, // seconds added per diamond (gift value)
     },
   },
+  comments: [], // { uniqueId, nickname, profilePicture, comment, ts }
 };
 
 let tiktokConnection = null;
-let subathonInterval = null;
 
-// ---------------------------------------------------------------------------
-// HELPERS
-// ---------------------------------------------------------------------------
-function broadcast() {
-  const payload = JSON.stringify({ type: 'state', data: state });
+function broadcast(type, payload) {
+  const msg = JSON.stringify({ type, payload });
   wss.clients.forEach((client) => {
-    if (client.readyState === 1) client.send(payload);
+    if (client.readyState === 1) client.send(msg);
   });
 }
 
-function upsertLeaderboard(board, user, incrementValue) {
-  const id = user.userId || user.uniqueId;
-  if (!board[id]) {
-    board[id] = {
-      userId: id,
-      uniqueId: user.uniqueId,
-      nickname: user.nickname || user.uniqueId,
-      profilePicture: (user.profilePictureUrl) || (user.profilePicture && user.profilePicture.urls && user.profilePicture.urls[0]) || '',
-      value: 0,
-    };
+function publicState() {
+  return {
+    connected: state.connected,
+    username: state.username,
+    stats: state.stats,
+    goal: state.goal,
+    subathon: state.subathon,
+    likeLeaderboard: [...state.likeLeaderboard.values()].sort((a, b) => b.likes - a.likes),
+    giftLeaderboard: [...state.giftLeaderboard.values()].sort((a, b) => b.diamonds - a.diamonds),
+    comments: state.comments.slice(-50),
+  };
+}
+
+function pushGoalProgress(type, amount) {
+  if (state.goal.type === type) {
+    state.goal.current += amount;
+    broadcast('goal', state.goal);
   }
-  board[id].value += incrementValue;
-}
-
-function topN(board, n) {
-  return Object.values(board)
-    .sort((a, b) => b.value - a.value)
-    .slice(0, n);
-}
-
-function addComment(user, text) {
-  state.comments.unshift({
-    userId: user.userId || user.uniqueId,
-    uniqueId: user.uniqueId,
-    nickname: user.nickname || user.uniqueId,
-    profilePicture: (user.profilePictureUrl) || (user.profilePicture && user.profilePicture.urls && user.profilePicture.urls[0]) || '',
-    comment: text,
-    ts: Date.now(),
-  });
-  if (state.comments.length > 100) state.comments.length = 100;
-  state.stats.comments += 1;
 }
 
 function addSubathonSeconds(seconds) {
-  if (!seconds) return;
-  state.subathon.remainingSeconds += seconds;
-}
-
-function startSubathonTicker() {
-  if (subathonInterval) clearInterval(subathonInterval);
-  subathonInterval = setInterval(() => {
-    if (!state.subathon.running) return;
-    if (state.subathon.remainingSeconds > 0) {
-      state.subathon.remainingSeconds -= 1;
-      broadcast();
-    } else {
-      state.subathon.running = false;
-      broadcast();
-    }
-  }, 1000);
+  if (!state.subathon.active || !seconds) return;
+  state.subathon.endsAt += seconds * 1000;
+  broadcast('subathon', state.subathon);
 }
 
 // ---------------------------------------------------------------------------
-// TIKTOK CONNECTOR
+// TikTok connection
 // ---------------------------------------------------------------------------
-async function connectToTikTok(username) {
+async function connectTikTok(username) {
   if (tiktokConnection) {
-    try { tiktokConnection.disconnect(); } catch (e) {}
-    tiktokConnection = null;
+    try { tiktokConnection.disconnect(); } catch (_) {}
   }
 
-  state.username = username;
-  state.connecting = true;
-  state.lastError = null;
-  broadcast();
+  tiktokConnection = new WebcastPushConnection(username);
 
-  tiktokConnection = new WebcastPushConnection(username, {
-    enableExtendedGiftInfo: true,
-  });
-
-  try {
-    const roomInfo = await tiktokConnection.connect();
-    state.connected = true;
-    state.connecting = false;
-    state.roomInfo = {
-      roomId: roomInfo.roomId,
-      title: roomInfo?.roomInfo?.title || null,
-    };
-    broadcast();
-  } catch (err) {
-    state.connected = false;
-    state.connecting = false;
-    state.lastError = String(err && err.message ? err.message : err);
-    broadcast();
-    return;
-  }
-
-  // ---- EVENTS ----
   tiktokConnection.on('chat', (data) => {
-    addComment(data, data.comment);
-    broadcast();
+    const entry = {
+      uniqueId: data.uniqueId,
+      nickname: data.nickname,
+      profilePicture: data.profilePictureUrl,
+      comment: data.comment,
+      ts: Date.now(),
+    };
+    state.comments.push(entry);
+    if (state.comments.length > 100) state.comments.shift();
+    broadcast('comment', entry);
   });
 
   tiktokConnection.on('like', (data) => {
     const inc = data.likeCount || 1;
     state.stats.likes += inc;
-    state.goals.like.current += inc;
-    upsertLeaderboard(state.likeLeaderboard, data, inc);
-    addSubathonSeconds(inc * state.subathon.rules.like);
-    broadcast();
+
+    const key = data.uniqueId;
+    const existing = state.likeLeaderboard.get(key) || {
+      uniqueId: data.uniqueId,
+      nickname: data.nickname,
+      profilePicture: data.profilePictureUrl,
+      likes: 0,
+    };
+    existing.likes += inc;
+    state.likeLeaderboard.set(key, existing);
+
+    pushGoalProgress('likes', inc);
+    addSubathonSeconds(inc * state.subathon.rules.secondsPerLike);
+    broadcast('likeLeaderboard', publicState().likeLeaderboard);
+    broadcast('stats', state.stats);
   });
 
   tiktokConnection.on('gift', (data) => {
-    // Only count gifts once they are "finished" (streak ended) to avoid
-    // double counting combo/streakable gifts.
+    // Streakable gifts fire repeatedly while the streak continues; only
+    // count the final tally once the streak ends (or if it's not streakable).
     const isStreakable = data.giftType === 1;
     if (isStreakable && !data.repeatEnd) return;
 
     const diamonds = (data.diamondCount || 0) * (data.repeatCount || 1);
-    state.stats.coins += diamonds;
-    state.goals.coin.current += diamonds;
-    upsertLeaderboard(state.giftLeaderboard, data, diamonds);
-    addSubathonSeconds(diamonds * state.subathon.rules.coin);
-    broadcast();
+    state.stats.diamonds += diamonds;
+
+    const key = data.uniqueId;
+    const existing = state.giftLeaderboard.get(key) || {
+      uniqueId: data.uniqueId,
+      nickname: data.nickname,
+      profilePicture: data.profilePictureUrl,
+      diamonds: 0,
+    };
+    existing.diamonds += diamonds;
+    state.giftLeaderboard.set(key, existing);
+
+    pushGoalProgress('coins', diamonds);
+    addSubathonSeconds(diamonds * state.subathon.rules.secondsPerDiamond);
+    broadcast('giftLeaderboard', publicState().giftLeaderboard);
+    broadcast('stats', state.stats);
   });
 
-  tiktokConnection.on('social', (data) => {
-    if (data.displayType && data.displayType.includes('follow')) {
-      state.stats.followers += 1;
-      state.goals.follower.current += 1;
-      addSubathonSeconds(state.subathon.rules.follower);
-      broadcast();
-    }
+  tiktokConnection.on('follow', () => {
+    state.stats.followers += 1;
+    pushGoalProgress('followers', 1);
+    addSubathonSeconds(state.subathon.rules.secondsPerFollow);
+    broadcast('stats', state.stats);
   });
 
   tiktokConnection.on('share', () => {
     state.stats.shares += 1;
-    state.goals.share.current += 1;
-    addSubathonSeconds(state.subathon.rules.share);
-    broadcast();
+    pushGoalProgress('share', 1);
+    addSubathonSeconds(state.subathon.rules.secondsPerShare);
+    broadcast('stats', state.stats);
   });
 
   tiktokConnection.on('roomUser', (data) => {
-    if (typeof data.viewerCount === 'number') {
-      state.stats.viewers = data.viewerCount;
-      broadcast();
-    }
+    state.stats.viewers = data.viewerCount || state.stats.viewers;
+    broadcast('stats', state.stats);
   });
 
   tiktokConnection.on('streamEnd', () => {
     state.connected = false;
-    broadcast();
+    broadcast('connection', { connected: false, username: state.username });
   });
 
   tiktokConnection.on('disconnected', () => {
     state.connected = false;
-    broadcast();
+    broadcast('connection', { connected: false, username: state.username });
   });
-}
 
-function disconnectFromTikTok() {
-  if (tiktokConnection) {
-    try { tiktokConnection.disconnect(); } catch (e) {}
-    tiktokConnection = null;
-  }
-  state.connected = false;
-  state.connecting = false;
-  broadcast();
+  await tiktokConnection.connect();
+  state.connected = true;
+  state.username = username;
+  broadcast('connection', { connected: true, username });
 }
 
 // ---------------------------------------------------------------------------
-// HTTP + WEBSOCKET SERVER
+// REST API
 // ---------------------------------------------------------------------------
-const app = express();
-app.use(cors({ origin: ALLOWED_ORIGINS.includes('*') ? '*' : ALLOWED_ORIGINS }));
-app.use(express.json());
-
-// Full current state (used by the dashboard on first load and by Roblox Studio polling)
-app.get('/api/state', (req, res) => {
-  res.json({
-    ...state,
-    likeLeaderboard: topN(state.likeLeaderboard, state.settings.likeLeaderboardSize),
-    giftLeaderboard: topN(state.giftLeaderboard, state.settings.giftLeaderboardSize),
-  });
-});
-
-// Lightweight endpoint, ideal for Roblox HttpService polling every few seconds
-app.get('/api/roblox', (req, res) => {
-  res.json({
-    connected: state.connected,
-    stats: state.stats,
-    goals: state.goals,
-    subathon: state.subathon,
-    topLikers: topN(state.likeLeaderboard, 5),
-    topGifters: topN(state.giftLeaderboard, 5),
-    latestComments: state.comments.slice(0, 5),
-  });
-});
+app.get('/api/state', (req, res) => res.json(publicState()));
 
 app.post('/api/connect', async (req, res) => {
   const { username } = req.body;
   if (!username) return res.status(400).json({ error: 'username is required' });
-  connectToTikTok(username.replace('@', ''));
-  res.json({ ok: true });
+  try {
+    await connectTikTok(username.replace('@', '').trim());
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/disconnect', (req, res) => {
-  disconnectFromTikTok();
+  if (tiktokConnection) tiktokConnection.disconnect();
+  state.connected = false;
+  broadcast('connection', { connected: false, username: state.username });
   res.json({ ok: true });
 });
 
-app.post('/api/settings', (req, res) => {
-  const { likeLeaderboardSize, giftLeaderboardSize } = req.body;
-  if (likeLeaderboardSize) state.settings.likeLeaderboardSize = Math.max(1, Math.min(50, likeLeaderboardSize));
-  if (giftLeaderboardSize) state.settings.giftLeaderboardSize = Math.max(1, Math.min(50, giftLeaderboardSize));
-  broadcast();
-  res.json({ ok: true, settings: state.settings });
+app.post('/api/goal', (req, res) => {
+  const { type, target, label, resetCurrent } = req.body;
+  if (type) state.goal.type = type;
+  if (typeof target === 'number') state.goal.target = target;
+  if (label) state.goal.label = label;
+  if (resetCurrent) state.goal.current = 0;
+  broadcast('goal', state.goal);
+  res.json(state.goal);
 });
 
-app.post('/api/goals', (req, res) => {
-  // body: { like: { enabled, target }, follower: {...}, coin: {...}, share: {...}, reset: true/false }
-  for (const key of ['like', 'follower', 'coin', 'share']) {
-    if (req.body[key]) {
-      if (typeof req.body[key].enabled === 'boolean') state.goals[key].enabled = req.body[key].enabled;
-      if (typeof req.body[key].target === 'number') state.goals[key].target = req.body[key].target;
-      if (req.body.reset) state.goals[key].current = 0;
-    }
-  }
-  broadcast();
-  res.json({ ok: true, goals: state.goals });
-});
-
-app.post('/api/subathon/config', (req, res) => {
-  const { rules, remainingSeconds } = req.body;
-  if (rules) Object.assign(state.subathon.rules, rules);
-  if (typeof remainingSeconds === 'number') state.subathon.remainingSeconds = remainingSeconds;
-  broadcast();
-  res.json({ ok: true, subathon: state.subathon });
+app.post('/api/goal/reset', (req, res) => {
+  state.goal.current = 0;
+  broadcast('goal', state.goal);
+  res.json(state.goal);
 });
 
 app.post('/api/subathon/start', (req, res) => {
-  state.subathon.running = true;
-  broadcast();
-  res.json({ ok: true });
+  const { initialSeconds, rules } = req.body;
+  state.subathon.active = true;
+  state.subathon.endsAt = Date.now() + (initialSeconds || 3600) * 1000;
+  if (rules) Object.assign(state.subathon.rules, rules);
+  broadcast('subathon', state.subathon);
+  res.json(state.subathon);
 });
 
-app.post('/api/subathon/pause', (req, res) => {
-  state.subathon.running = false;
-  broadcast();
-  res.json({ ok: true });
-});
-
-app.post('/api/subathon/add', (req, res) => {
+app.post('/api/subathon/addtime', (req, res) => {
   const { seconds } = req.body;
-  addSubathonSeconds(Number(seconds) || 0);
-  broadcast();
-  res.json({ ok: true, remainingSeconds: state.subathon.remainingSeconds });
+  addSubathonSeconds(seconds || 0);
+  res.json(state.subathon);
 });
 
-app.post('/api/reset-leaderboards', (req, res) => {
-  for (const k of Object.keys(state.likeLeaderboard)) delete state.likeLeaderboard[k];
-  for (const k of Object.keys(state.giftLeaderboard)) delete state.giftLeaderboard[k];
-  broadcast();
+app.post('/api/subathon/stop', (req, res) => {
+  state.subathon.active = false;
+  broadcast('subathon', state.subathon);
+  res.json(state.subathon);
+});
+
+app.post('/api/leaderboards/reset', (req, res) => {
+  state.likeLeaderboard.clear();
+  state.giftLeaderboard.clear();
+  broadcast('likeLeaderboard', []);
+  broadcast('giftLeaderboard', []);
   res.json({ ok: true });
 });
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+// Simple polling endpoint tailored for Roblox Studio (HttpService has no
+// native WebSocket support), returns a lean payload.
+app.get('/api/roblox/state', (req, res) => {
+  const p = publicState();
+  res.json({
+    connected: p.connected,
+    stats: p.stats,
+    goal: p.goal,
+    subathon: p.subathon,
+    topLikers: p.likeLeaderboard.slice(0, 5),
+    topGifters: p.giftLeaderboard.slice(0, 5),
+    latestComments: p.comments.slice(-5),
+  });
+});
 
 wss.on('connection', (ws) => {
-  ws.send(JSON.stringify({ type: 'state', data: state }));
+  ws.send(JSON.stringify({ type: 'state', payload: publicState() }));
 });
 
-startSubathonTicker();
-
 server.listen(PORT, () => {
-  console.log(`TikTok dashboard backend listening on port ${PORT}`);
-  if (process.env.TIKTOK_USERNAME) {
-    connectToTikTok(process.env.TIKTOK_USERNAME);
-  }
+  console.log(`TikTok dashboard server running on http://localhost:${PORT}`);
 });
