@@ -4,7 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const { WebcastPushConnection } = require('tiktok-live-connector');
+const { TikTokLiveConnection, WebcastEvent } = require('tiktok-live-connector');
 
 const PORT = process.env.PORT || 8080;
 
@@ -79,22 +79,47 @@ function addSubathonSeconds(seconds) {
   broadcast('subathon', state.subathon);
 }
 
+// v2 API: avatar & user fields sudah nested di bawah `user`, bukan flat lagi.
+function extractAvatar(user) {
+  if (!user) return '';
+  return (
+    (user.avatarThumb && Array.isArray(user.avatarThumb.urlList) && user.avatarThumb.urlList[0]) ||
+    (user.profilePicture && Array.isArray(user.profilePicture.urls) && user.profilePicture.urls[0]) ||
+    user.profilePictureUrl ||
+    ''
+  );
+}
+
 // ---------------------------------------------------------------------------
 // TikTok connection
 // ---------------------------------------------------------------------------
 async function connectTikTok(username) {
   if (tiktokConnection) {
-    try { tiktokConnection.disconnect(); } catch (_) {}
+    try {
+      tiktokConnection.removeAllListeners();
+      tiktokConnection.disconnect();
+    } catch (_) {}
   }
 
-  tiktokConnection = new WebcastPushConnection(username);
+  // v2: constructor-nya TikTokLiveConnection, bukan WebcastPushConnection
+  tiktokConnection = new TikTokLiveConnection(username);
 
-  tiktokConnection.on('chat', (data) => {
+  const CHAT_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.CHAT) || 'chat';
+  const GIFT_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.GIFT) || 'gift';
+  const LIKE_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.LIKE) || 'like';
+  const FOLLOW_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.FOLLOW) || 'follow';
+  const SHARE_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.SHARE) || 'share';
+  const ROOM_USER_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.ROOM_USER) || 'roomUser';
+  const STREAM_END_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.STREAM_END) || 'streamEnd';
+  const DISCONNECTED_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.DISCONNECTED) || 'disconnected';
+
+  tiktokConnection.on(CHAT_EVENT, (data) => {
+    const uniqueId = data.user?.uniqueId || data.user?.displayId || 'unknown';
     const entry = {
-      uniqueId: data.uniqueId,
-      nickname: data.nickname,
-      profilePicture: data.profilePictureUrl,
-      comment: data.comment,
+      uniqueId,
+      nickname: data.user?.nickname || uniqueId,
+      profilePicture: extractAvatar(data.user),
+      comment: data.comment ?? data.content ?? '',
       // 0 = belum follow, 1 = following, 2 = friends (saling follow)
       followRole: typeof data.followRole === 'number' ? data.followRole : 0,
       ts: Date.now(),
@@ -104,15 +129,15 @@ async function connectTikTok(username) {
     broadcast('comment', entry);
   });
 
-  tiktokConnection.on('like', (data) => {
-    const inc = data.likeCount || 1;
+  tiktokConnection.on(LIKE_EVENT, (data) => {
+    const inc = data.likeCount || data.count || 1;
     state.stats.likes += inc;
 
-    const key = data.uniqueId;
+    const key = data.user?.uniqueId || data.user?.displayId || 'unknown';
     const existing = state.likeLeaderboard.get(key) || {
-      uniqueId: data.uniqueId,
-      nickname: data.nickname,
-      profilePicture: data.profilePictureUrl,
+      uniqueId: key,
+      nickname: data.user?.nickname || key,
+      profilePicture: extractAvatar(data.user),
       likes: 0,
     };
     existing.likes += inc;
@@ -124,20 +149,22 @@ async function connectTikTok(username) {
     broadcast('stats', state.stats);
   });
 
-  tiktokConnection.on('gift', (data) => {
+  tiktokConnection.on(GIFT_EVENT, (data) => {
     // Streakable gifts fire repeatedly while the streak continues; only
     // count the final tally once the streak ends (or if it's not streakable).
-    const isStreakable = data.giftType === 1;
+    const giftType = data.giftDetails?.giftType ?? data.giftType;
+    const isStreakable = giftType === 1;
     if (isStreakable && !data.repeatEnd) return;
 
-    const diamonds = (data.diamondCount || 0) * (data.repeatCount || 1);
+    const diamondCount = data.giftDetails?.diamondCount ?? data.diamondCount ?? 0;
+    const diamonds = diamondCount * (data.repeatCount || 1);
     state.stats.diamonds += diamonds;
 
-    const key = data.uniqueId;
+    const key = data.user?.uniqueId || data.user?.displayId || 'unknown';
     const existing = state.giftLeaderboard.get(key) || {
-      uniqueId: data.uniqueId,
-      nickname: data.nickname,
-      profilePicture: data.profilePictureUrl,
+      uniqueId: key,
+      nickname: data.user?.nickname || key,
+      profilePicture: extractAvatar(data.user),
       diamonds: 0,
     };
     existing.diamonds += diamonds;
@@ -149,39 +176,43 @@ async function connectTikTok(username) {
     broadcast('stats', state.stats);
   });
 
-  tiktokConnection.on('follow', () => {
+  tiktokConnection.on(FOLLOW_EVENT, () => {
     state.stats.followers += 1;
     pushGoalProgress('followers', 1);
     addSubathonSeconds(state.subathon.rules.secondsPerFollow);
     broadcast('stats', state.stats);
   });
 
-  tiktokConnection.on('share', () => {
+  tiktokConnection.on(SHARE_EVENT, () => {
     state.stats.shares += 1;
     pushGoalProgress('share', 1);
     addSubathonSeconds(state.subathon.rules.secondsPerShare);
     broadcast('stats', state.stats);
   });
 
-  tiktokConnection.on('roomUser', (data) => {
+  tiktokConnection.on(ROOM_USER_EVENT, (data) => {
     state.stats.viewers = data.viewerCount || state.stats.viewers;
     broadcast('stats', state.stats);
   });
 
-  tiktokConnection.on('streamEnd', () => {
+  tiktokConnection.on(STREAM_END_EVENT, () => {
     state.connected = false;
     broadcast('connection', { connected: false, username: state.username });
   });
 
-  tiktokConnection.on('disconnected', () => {
+  tiktokConnection.on(DISCONNECTED_EVENT, () => {
     state.connected = false;
     broadcast('connection', { connected: false, username: state.username });
   });
 
-  await tiktokConnection.connect();
+  tiktokConnection.on('error', (err) => {
+    console.error('[TikTok error]', err && err.info ? err.info : err);
+  });
+
+  const roomInfo = await tiktokConnection.connect();
   state.connected = true;
   state.username = username;
-  broadcast('connection', { connected: true, username });
+  broadcast('connection', { connected: true, username, roomId: roomInfo?.roomId });
 }
 
 // ---------------------------------------------------------------------------
