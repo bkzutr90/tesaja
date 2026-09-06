@@ -30,6 +30,10 @@ const state = {
     label: 'Like Goal',
     target: 1000,
     current: 0,
+    autoIncrease: false, // kalau true, target otomatis naik saat tercapai
+    increment: 1000, // besar kenaikan target tiap kali auto-increase terpicu
+    timesReached: 0, // counter monoton: berapa kali goal ini sudah tercapai
+    _crossed: false, // internal, dipakai deteksi crossing saat autoIncrease OFF
   },
   subathon: {
     active: false,
@@ -69,6 +73,34 @@ function publicState() {
 function pushGoalProgress(type, amount) {
   if (state.goal.type === type) {
     state.goal.current += amount;
+
+    if (state.goal.autoIncrease && state.goal.increment > 0) {
+      // Auto-increase: begitu current >= target, target dinaikkan sejumlah
+      // `increment` (bisa berkali-kali kalau amount-nya besar/lompat jauh),
+      // TANPA mereset current — progress lanjut terus dari angka sekarang.
+      // timesReached dihitung PER kelipatan yang terlewati, supaya lompatan
+      // besar (mis. like batch 9 -> 25 dengan target 10) tetap terhitung
+      // 2x tercapai, bukan cuma 1x — ini yang bikin Roblox cuma spawn 1 mobil
+      // padahal seharusnya 2.
+      while (state.goal.current >= state.goal.target) {
+        state.goal.target += state.goal.increment;
+        state.goal.timesReached += 1;
+      }
+    } else {
+      // Mode manual (tanpa auto-increase): target tidak berubah, jadi cukup
+      // deteksi crossing sekali sampai direset. _crossed mencegah
+      // timesReached nambah terus tiap event selama current masih di atas
+      // target yang sama.
+      if (state.goal.current >= state.goal.target) {
+        if (!state.goal._crossed) {
+          state.goal._crossed = true;
+          state.goal.timesReached += 1;
+        }
+      } else {
+        state.goal._crossed = false;
+      }
+    }
+
     broadcast('goal', state.goal);
   }
 }
@@ -258,17 +290,31 @@ app.post('/api/disconnect', (req, res) => {
 });
 
 app.post('/api/goal', (req, res) => {
-  const { type, target, label, resetCurrent } = req.body;
+  const { type, target, label, resetCurrent, autoIncrease, increment } = req.body;
   if (type) state.goal.type = type;
   if (typeof target === 'number') state.goal.target = target;
   if (label) state.goal.label = label;
-  if (resetCurrent) state.goal.current = 0;
+  if (typeof autoIncrease === 'boolean') state.goal.autoIncrease = autoIncrease;
+  if (typeof increment === 'number' && increment > 0) {
+    state.goal.increment = increment;
+  } else if (typeof target === 'number') {
+    // default: besar kenaikan sama dengan target yang baru di-set,
+    // kecuali user secara eksplisit mengisi kolom increment sendiri
+    state.goal.increment = target;
+  }
+  if (resetCurrent) {
+    state.goal.current = 0;
+    state.goal.timesReached = 0;
+    state.goal._crossed = false;
+  }
   broadcast('goal', state.goal);
   res.json(state.goal);
 });
 
 app.post('/api/goal/reset', (req, res) => {
   state.goal.current = 0;
+  state.goal.timesReached = 0;
+  state.goal._crossed = false;
   broadcast('goal', state.goal);
   res.json(state.goal);
 });
