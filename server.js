@@ -101,8 +101,17 @@ async function connectTikTok(username) {
     } catch (_) {}
   }
 
-  // v2: constructor-nya TikTokLiveConnection, bukan WebcastPushConnection
-  tiktokConnection = new TikTokLiveConnection(username);
+  // v2: constructor-nya TikTokLiveConnection, bukan WebcastPushConnection.
+  // PENTING: selalu kirim objek options eksplisit (walau kosong) — beberapa
+  // versi 2.x crash ("Cannot read properties of undefined (reading
+  // 'processInitialData')") kalau parameter kedua tidak diberikan sama sekali.
+  tiktokConnection = new TikTokLiveConnection(username, {
+    processInitialData: false,
+    // Kalau kamu sudah punya API key gratis dari eulerstream.com, isi di sini
+    // atau lewat env var SIGN_API_KEY. Tanpa ini kamu kena rate-limit tier
+    // gratis yang kadang bikin response sign server tidak lengkap.
+    signApiKey: process.env.SIGN_API_KEY || undefined,
+  });
 
   const CHAT_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.CHAT) || 'chat';
   const GIFT_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.GIFT) || 'gift';
