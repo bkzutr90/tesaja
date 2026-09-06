@@ -44,7 +44,7 @@
     const m = Math.floor((totalSec % 3600) / 60);
     const s = totalSec % 60;
     document.getElementById('clock').textContent = `${pad(h)}:${pad(m)}:${pad(s)}`;
-    document.getElementById('status').textContent = remainMs > 0 ? 'LIVE — waktu bertambah tiap gift/like/follow' : 'WAKTU HABIS';
+    document.getElementById('status').textContent = remainMs > 0 ? '1 Coin +10 detik' : 'WAKTU HABIS';
   }
   setInterval(tick, 1000);
 
