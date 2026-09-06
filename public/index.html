@@ -25,6 +25,14 @@
   button:hover { opacity: 0.9; }
   .status-line { font-size: 13px; color: var(--text-dim); margin-top: 8px; }
   .link-list a { color: var(--cyan); display: block; margin: 4px 0; font-size: 13px; }
+  .checkbox-row {
+    display: flex; align-items: center; gap: 8px; margin-top: 12px;
+  }
+  .checkbox-row input[type="checkbox"] { width: auto; }
+  .checkbox-row label { margin: 0; font-size: 13px; color: var(--text); cursor: pointer; }
+  #increment-wrap { display: none; }
+  #increment-wrap.show { display: block; }
+  .hint { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -60,8 +68,20 @@
     </div>
     <label>Label</label>
     <input id="goal-label" value="Goal Live Hari Ini" />
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="goal-auto-increase" onchange="toggleIncrementInput()" />
+      <label for="goal-auto-increase">Auto increase goal saat tercapai</label>
+    </div>
+    <div id="increment-wrap">
+      <label>Kenaikan target tiap tercapai</label>
+      <input id="goal-increment" type="number" placeholder="kosongkan = samakan dengan Target" />
+      <div class="hint">Contoh: Target 1000, kenaikan 1000 → begitu tercapai, target otomatis jadi 2000, progress lanjut tanpa reset.</div>
+    </div>
+
     <button onclick="setGoal()">Simpan Goal</button>
     <button onclick="resetGoal()" style="background:#333;color:#fff">Reset Progress</button>
+    <div class="status-line" id="goal-status"></div>
   </div>
 
   <div class="panel card">
@@ -116,16 +136,34 @@
     document.getElementById('conn-status').textContent = 'terputus';
   }
 
-  async function setGoal() {
-    await api('/api/goal', {
-      type: document.getElementById('goal-type').value,
-      target: Number(document.getElementById('goal-target').value),
-      label: document.getElementById('goal-label').value,
-      resetCurrent: true,
-    });
+  function toggleIncrementInput() {
+    const checked = document.getElementById('goal-auto-increase').checked;
+    document.getElementById('increment-wrap').classList.toggle('show', checked);
   }
 
-  async function resetGoal() { await api('/api/goal/reset'); }
+  async function setGoal() {
+    const target = Number(document.getElementById('goal-target').value);
+    const autoIncrease = document.getElementById('goal-auto-increase').checked;
+    const incrementRaw = document.getElementById('goal-increment').value;
+    const body = {
+      type: document.getElementById('goal-type').value,
+      target,
+      label: document.getElementById('goal-label').value,
+      resetCurrent: true,
+      autoIncrease,
+    };
+    // kosongkan kolom increment -> biarkan backend default-kan ke nilai target
+    if (incrementRaw !== '') body.increment = Number(incrementRaw);
+    const result = await api('/api/goal', body);
+    document.getElementById('goal-status').textContent =
+      `Tersimpan: ${result.label} — ${result.current}/${result.target}` +
+      (result.autoIncrease ? ` (auto +${result.increment} tiap tercapai)` : '');
+  }
+
+  async function resetGoal() {
+    await api('/api/goal/reset');
+    document.getElementById('goal-status').textContent = 'Progress direset ke 0.';
+  }
 
   async function startSubathon() {
     await api('/api/subathon/start', {
