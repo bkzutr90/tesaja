@@ -1,10 +1,11 @@
 {
-  "name": "tiktok-live-dashboard-backend",
+  "name": "show",
   "version": "1.0.0",
-  "description": "Backend connector for TikTok LIVE dashboard (like/gift leaderboard, goals, subathon timer, comments, Roblox bridge)",
+  "description": "TikTok Live dashboard + OBS widgets + Roblox bridge",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "keywords": [],
   "author": "",
