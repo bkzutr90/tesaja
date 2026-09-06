@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<title>Comments</title>
+<link rel="stylesheet" href="shared.css" />
+<style>
+  body { width: 420px; height: 320px; }
+  #list { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow: hidden; }
+  .comment-row { display: flex; gap: 8px; align-items: flex-start; animation: slideIn 0.35s ease; }
+  .comment-body { background: rgba(255,255,255,0.06); border-radius: 10px; padding: 6px 10px; flex: 1; }
+  .comment-name { font-size: 12px; font-weight: 700; color: var(--cyan); }
+  .comment-text { font-size: 13px; word-break: break-word; }
+  @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <div class="panel-title"><span class="dot"></span>LIVE CHAT</div>
+    <div id="list"></div>
+  </div>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  const MAX_VISIBLE = Math.max(1, parseInt(params.get('count') || '6', 10));
+  const WS_URL = (params.get('server') || (location.origin.replace('http', 'ws') + '/ws'));
+
+  const listEl = document.getElementById('list');
+  let comments = [];
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function render() {
+    const visible = comments.slice(-MAX_VISIBLE);
+    listEl.innerHTML = visible.map((c) => `
+      <div class="comment-row">
+        <img class="avatar" style="width:26px;height:26px" src="${c.profilePicture || ''}" onerror="this.style.visibility='hidden'" />
+        <div class="comment-body">
+          <div class="comment-name">${escapeHtml(c.nickname || c.uniqueId)}</div>
+          <div class="comment-text">${escapeHtml(c.comment)}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function connect() {
+    const ws = new WebSocket(WS_URL);
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'comment') {
+        comments.push(msg.payload);
+        if (comments.length > 100) comments.shift();
+        render();
+      }
+      if (msg.type === 'state') {
+        comments = msg.payload.comments || [];
+        render();
+      }
+    };
+    ws.onclose = () => setTimeout(connect, 2000);
+    ws.onerror = () => ws.close();
+  }
+  connect();
+</script>
+</body>
+</html>
