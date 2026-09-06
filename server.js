@@ -123,14 +123,21 @@ async function connectTikTok(username) {
   const DISCONNECTED_EVENT = (typeof WebcastEvent !== 'undefined' && WebcastEvent.DISCONNECTED) || 'disconnected';
 
   tiktokConnection.on(CHAT_EVENT, (data) => {
+    if (process.env.DEBUG_TIKTOK) console.log('[DEBUG chat]', JSON.stringify(data));
     const uniqueId = data.user?.uniqueId || data.user?.displayId || 'unknown';
+    // v2: status follow bukan lagi flat `data.followRole` (field itu sudah
+    // tidak ada di API v2 dan selalu undefined) melainkan nested di
+    // `data.userIdentity.isFollowerOfAnchor` (boolean). Ini penyebab kenapa
+    // walker tidak pernah spawn - followRole selalu ke-default 0.
+    const isFollower = !!(data.userIdentity && data.userIdentity.isFollowerOfAnchor);
     const entry = {
       uniqueId,
       nickname: data.user?.nickname || uniqueId,
       profilePicture: extractAvatar(data.user),
       comment: data.comment ?? data.content ?? '',
-      // 0 = belum follow, 1 = following, 2 = friends (saling follow)
-      followRole: typeof data.followRole === 'number' ? data.followRole : 0,
+      // 0 = belum follow, 1 = following (dipertahankan sebagai angka supaya
+      // kompatibel dengan Lua yang mengecek `comment.followRole >= 1`)
+      followRole: isFollower ? 1 : 0,
       ts: Date.now(),
     };
     state.comments.push(entry);
@@ -139,7 +146,10 @@ async function connectTikTok(username) {
   });
 
   tiktokConnection.on(LIKE_EVENT, (data) => {
-    const inc = data.likeCount || data.count || 1;
+    if (process.env.DEBUG_TIKTOK) console.log('[DEBUG like]', JSON.stringify(data));
+    // v2: nama field batch like bisa beda-beda tergantung sub-versi
+    // (likeCount / count / totalLikeCount). Ambil yang pertama tersedia.
+    const inc = data.likeCount || data.count || data.totalLikeCount || 1;
     state.stats.likes += inc;
 
     const key = data.user?.uniqueId || data.user?.displayId || 'unknown';
