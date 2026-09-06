@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<title>Control Panel — TikTok Live Dashboard</title>
+<link rel="stylesheet" href="shared.css" />
+<style>
+  html, body { background: #05060a; overflow: auto; }
+  body { padding: 32px; max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 22px; }
+  .card { margin-bottom: 20px; }
+  label { display: block; font-size: 12px; color: var(--text-dim); margin: 10px 0 4px; }
+  input, select {
+    width: 100%; padding: 9px 10px; border-radius: 8px;
+    border: 1px solid var(--panel-line); background: rgba(255,255,255,0.05);
+    color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  }
+  .row-inline { display: flex; gap: 10px; }
+  .row-inline > div { flex: 1; }
+  button {
+    margin-top: 14px; padding: 10px 16px; border: none; border-radius: 8px;
+    background: linear-gradient(90deg, var(--cyan), var(--pink));
+    color: #05060a; font-weight: 700; cursor: pointer; font-family: 'Sora', sans-serif;
+  }
+  button:hover { opacity: 0.9; }
+  .status-line { font-size: 13px; color: var(--text-dim); margin-top: 8px; }
+  .link-list a { color: var(--cyan); display: block; margin: 4px 0; font-size: 13px; }
+</style>
+</head>
+<body>
+  <h1>🎛️ TikTok Live — Control Panel</h1>
+
+  <div class="panel card">
+    <div class="panel-title">KONEKSI</div>
+    <label>Username TikTok (tanpa @)</label>
+    <input id="username" placeholder="contoh: username_live" />
+    <div class="row-inline">
+      <button onclick="connectTikTok()">Connect</button>
+      <button onclick="disconnectTikTok()" style="background:#333;color:#fff">Disconnect</button>
+    </div>
+    <div class="status-line" id="conn-status">belum terkoneksi</div>
+  </div>
+
+  <div class="panel card">
+    <div class="panel-title">GOAL</div>
+    <div class="row-inline">
+      <div>
+        <label>Tipe</label>
+        <select id="goal-type">
+          <option value="likes">Likes</option>
+          <option value="followers">Followers</option>
+          <option value="coins">Coins</option>
+          <option value="share">Share</option>
+        </select>
+      </div>
+      <div>
+        <label>Target</label>
+        <input id="goal-target" type="number" value="1000" />
+      </div>
+    </div>
+    <label>Label</label>
+    <input id="goal-label" value="Goal Live Hari Ini" />
+    <button onclick="setGoal()">Simpan Goal</button>
+    <button onclick="resetGoal()" style="background:#333;color:#fff">Reset Progress</button>
+  </div>
+
+  <div class="panel card">
+    <div class="panel-title">SUBATHON</div>
+    <label>Waktu awal (menit)</label>
+    <input id="sub-initial" type="number" value="60" />
+    <div class="row-inline">
+      <div><label>Detik / 1 diamond</label><input id="sub-diamond" type="number" step="0.1" value="1" /></div>
+      <div><label>Detik / follow</label><input id="sub-follow" type="number" step="0.1" value="10" /></div>
+    </div>
+    <div class="row-inline">
+      <div><label>Detik / share</label><input id="sub-share" type="number" step="0.1" value="15" /></div>
+      <div><label>Detik / like (per like)</label><input id="sub-like" type="number" step="0.01" value="0.05" /></div>
+    </div>
+    <button onclick="startSubathon()">Start / Restart Subathon</button>
+    <button onclick="stopSubathon()" style="background:#333;color:#fff">Stop</button>
+  </div>
+
+  <div class="panel card">
+    <div class="panel-title">LINK WIDGET (untuk OBS Browser Source)</div>
+    <div class="link-list" id="links"></div>
+  </div>
+
+<script>
+  const origin = location.origin;
+  document.getElementById('links').innerHTML = `
+    <a href="${origin}/like-leaderboard.html?count=5" target="_blank">${origin}/like-leaderboard.html?count=5</a>
+    <a href="${origin}/gift-leaderboard.html?count=5" target="_blank">${origin}/gift-leaderboard.html?count=5</a>
+    <a href="${origin}/goal.html" target="_blank">${origin}/goal.html</a>
+    <a href="${origin}/subathon.html" target="_blank">${origin}/subathon.html</a>
+    <a href="${origin}/comments.html?count=6" target="_blank">${origin}/comments.html?count=6</a>
+  `;
+
+  async function api(pathName, body) {
+    const res = await fetch(origin + pathName, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    return res.json();
+  }
+
+  async function connectTikTok() {
+    const username = document.getElementById('username').value.trim();
+    document.getElementById('conn-status').textContent = 'menghubungkan...';
+    const result = await api('/api/connect', { username });
+    document.getElementById('conn-status').textContent = result.error ? ('gagal: ' + result.error) : ('terkoneksi ke @' + username);
+  }
+
+  async function disconnectTikTok() {
+    await api('/api/disconnect');
+    document.getElementById('conn-status').textContent = 'terputus';
+  }
+
+  async function setGoal() {
+    await api('/api/goal', {
+      type: document.getElementById('goal-type').value,
+      target: Number(document.getElementById('goal-target').value),
+      label: document.getElementById('goal-label').value,
+      resetCurrent: true,
+    });
+  }
+
+  async function resetGoal() { await api('/api/goal/reset'); }
+
+  async function startSubathon() {
+    await api('/api/subathon/start', {
+      initialSeconds: Number(document.getElementById('sub-initial').value) * 60,
+      rules: {
+        secondsPerDiamond: Number(document.getElementById('sub-diamond').value),
+        secondsPerFollow: Number(document.getElementById('sub-follow').value),
+        secondsPerShare: Number(document.getElementById('sub-share').value),
+        secondsPerLike: Number(document.getElementById('sub-like').value),
+      },
+    });
+  }
+
+  async function stopSubathon() { await api('/api/subathon/stop'); }
+</script>
+</body>
+</html>
